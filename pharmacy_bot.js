@@ -4,13 +4,18 @@ const cron = require('node-cron');
 const { GoogleGenAI } = require('@google/genai'); 
 require('dotenv').config();
 
-// configurations here
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Initialize the Gemini API client
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+function reportProgress(message) {
+    console.log(message); 
+    if (global.syncBotState && typeof global.syncBotState.log === 'function') {
+        global.syncBotState.log(message); 
+    }
+}
 
 function getFrenchTodayDate() {
     const today = new Date();
@@ -29,7 +34,7 @@ function getFrenchTodayDate() {
 }
 
 async function generateSummaryWithAI(pharmaciesList, dateStr) {
-    console.log('🤖 Sending data to Google Gemini for AI optimization...');
+    reportProgress('🤖 Sending data to Google Gemini for AI optimization...');
     try {
         const response = await ai.models.generateContent({
             model: 'gemini-2.5-flash', 
@@ -49,20 +54,18 @@ async function generateSummaryWithAI(pharmaciesList, dateStr) {
         });
 
         let aiText = response.text;
-
         if (aiText) {
             aiText = aiText.replace(/<p>/gi, '').replace(/<\/p>/gi, '\n');
         }
-
         return aiText;
     } catch (error) {
-        console.error('❌ Gemini API Error:', error);
+        reportProgress(`❌ Gemini API Error: ${error.message}`);
         return null;
     }
 }
 
 async function scrapePharmacies() {
-    console.log('🔄 Starting web scraping for today\'s on-duty pharmacies...');
+    reportProgress('🔄 Starting web scraping for today\'s on-duty pharmacies...');
     const browser = await chromium.launch({ headless: true }); 
     const page = await browser.newPage();
     
@@ -70,7 +73,7 @@ async function scrapePharmacies() {
         await page.goto('https://www.guidepharmacies.ma/pharmacies-de-garde/sale.html', { waitUntil: 'networkidle' });
 
         const dateInfo = getFrenchTodayDate();
-        console.log(`📅 Searching for today's date on the website: ${dateInfo.frenchPattern}`);
+        reportProgress(`📅 Searching for today's date on the website: ${dateInfo.frenchPattern}`);
         
         const pharmaciesToday = await page.evaluate((targetDatePattern) => {
             const rows = document.querySelectorAll('table tr');
@@ -124,25 +127,25 @@ async function scrapePharmacies() {
         }, dateInfo.frenchPattern);
 
         if (pharmaciesToday.length === 0) {
-            console.log('⚠️ No pharmacies found for today\'s date.');
+            reportProgress('⚠️ No pharmacies found for today\'s date.');
             return;
         }
 
-        console.log(`✅ Successfully extracted ${pharmaciesToday.length} pharmacies.`);
+        reportProgress(`✅ Successfully extracted ${pharmaciesToday.length} pharmacies.`);
         
         const aiSummaryMessage = await generateSummaryWithAI(pharmaciesToday, dateInfo.standard);
         
         if (aiSummaryMessage) {
             await sendTextMessageToTelegram(aiSummaryMessage);
         } else {
-            console.log('⚠️ AI generation failed, falling back to JSON backup file...');
+            reportProgress('⚠️ AI generation failed, falling back to JSON backup file...');
             const fileName = `pharmacies_today_sale.json`;
             fs.writeFileSync(fileName, JSON.stringify(pharmaciesToday, null, 2));
             await sendFileToTelegram(fileName, dateInfo.standard);
         }
 
     } catch (error) {
-        console.error('❌ An error occurred during scraping:', error);
+        throw error;
     } finally {
         await browser.close();
     }
@@ -151,7 +154,6 @@ async function scrapePharmacies() {
 async function sendTextMessageToTelegram(textMessage) {
     const fetch = (await import('node-fetch')).default;
     const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
-    
     const cleanMessage = textMessage.trim();
 
     try {
@@ -166,18 +168,12 @@ async function sendTextMessageToTelegram(textMessage) {
         });
         const result = await response.json();
         if (result.ok) {
-            console.log('🚀 Gemini AI Summary report sent to Telegram successfully!');
+            reportProgress('🚀 Gemini AI Summary report sent to Telegram successfully!');
         } else {
-            console.error('❌ Failed to send text to Telegram:', result.description);
-            console.log('🔄 Trying to send as plain text fallback...');
-            await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chat_id: CHAT_ID, text: cleanMessage.replace(/<[^>]*>/g, '') })
-            });
+            reportProgress(`❌ Failed to send text to Telegram: ${result.description}`);
         }
     } catch (err) {
-        console.error('❌ Telegram API error:', err);
+        reportProgress(`❌ Telegram API error: ${err.message}`);
     }
 }
 
@@ -195,20 +191,30 @@ async function sendFileToTelegram(filePath, dateStr) {
         const response = await fetch(url, { method: 'POST', body: form });
         const result = await response.json();
         if (result.ok) {
-            console.log('🚀 Backup file sent successfully!');
+            reportProgress('🚀 Backup file sent successfully!');
             fs.unlinkSync(filePath);
         }
     } catch (err) {
-        console.error(err);
+        reportProgress(`❌ File upload error: ${err.message}`);
     }
 }
 
-cron.schedule('0 20 * * *', () => {
-    scrapePharmacies();
+cron.schedule('00 20 * * *', async () => {
+    if (global.syncBotState) {
+        try {
+            global.syncBotState.start('⏰ Automated Scheduled Cron run initiated (20:00 Casablanca Time).');
+            await scrapePharmacies();
+            global.syncBotState.success();
+        } catch (error) {
+            global.syncBotState.failed(error.message);
+        }
+    } else {
+        console.log('⏰ Standard isolated cron run triggered.');
+        scrapePharmacies().catch(console.error);
+    }
 }, {
     scheduled: true,
     timezone: "Africa/Casablanca"
 });
 
-// Immediate call for testing
-scrapePharmacies();
+module.exports = { scrapePharmacies };
