@@ -1,18 +1,20 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
 const cron = require('node-cron');
+const { GoogleGenAI } = require('@google/genai'); 
+require('dotenv').config();
 
-//Place your Telegram configuration here
-const TELEGRAM_TOKEN = '8153180271:AAHx-LdWP8--2oYrDWlxnV1rvD6jKMZA248';
-const CHAT_ID = '1447383528';
+// configurations here
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const CHAT_ID = process.env.CHAT_ID;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Function to convert the current date to the French format used by the website (e.g., "lundi 01 juin 2026")
+// Initialize the Gemini API client
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
 function getFrenchTodayDate() {
     const today = new Date();
-    
-    // Array of weekdays in French
     const days = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
-    // Array of months in French
     const months = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
     
     const dayName = days[today.getDay()];
@@ -24,6 +26,39 @@ function getFrenchTodayDate() {
         standard: `${dayNumber}/${String(today.getMonth() + 1).padStart(2, '0')}/${year}`,
         frenchPattern: `${dayName} ${dayNumber} ${monthName} ${year}`
     };
+}
+
+async function generateSummaryWithAI(pharmaciesList, dateStr) {
+    console.log('🤖 Sending data to Google Gemini for AI optimization...');
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash', 
+            config: {
+                systemInstruction: `You are an assistant for a local community Telegram channel in Salé, Morocco. 
+                Your job is to read a JSON array of on-duty pharmacies and rewrite it into a highly professional, beautifully formatted, easy-to-read bulletin report in Arabic.
+                Use appropriate emojis (🏥, 📍, 📞, 🌟). Sort them or format them so a normal citizen can read them immediately on their phone screen. 
+                Do not change the phone numbers or the names of the pharmacies.
+                
+                CRITICAL HTML RULES FOR TELEGRAM:
+                - Use ONLY <b>text</b> for bold text and <i>text</i> for italics.
+                - Never use markdown symbols like * or _.
+                - NEVER use block tags like <p>, </p>, <div>, <span>, or <br/>.
+                - To make a new line, just hit Enter/Return naturally in your plain text output.`
+            },
+            contents: `Here is the list of on-duty pharmacies for today (${dateStr}): ${JSON.stringify(pharmaciesList)}`,
+        });
+
+        let aiText = response.text;
+
+        if (aiText) {
+            aiText = aiText.replace(/<p>/gi, '').replace(/<\/p>/gi, '\n');
+        }
+
+        return aiText;
+    } catch (error) {
+        console.error('❌ Gemini API Error:', error);
+        return null;
+    }
 }
 
 async function scrapePharmacies() {
@@ -43,38 +78,32 @@ async function scrapePharmacies() {
             let isTodaySection = false;
 
             rows.forEach(row => {
-                // 1. Check and search for the date cell
                 const dateCell = row.querySelector('td.tableh2');
                 if (dateCell) {
-                    // Clean text from extra spaces, hidden characters, and normalize to lowercase
                     const dateText = dateCell.innerText.replace(/\s+/g, ' ').trim().toLowerCase();
                     const cleanTargetPattern = targetDatePattern.replace(/\s+/g, ' ').trim().toLowerCase();
                     
                     if (dateText.includes(cleanTargetPattern)) {
                         isTodaySection = true;
                     } else {
-                        isTodaySection = false; // Stop collecting if it moves to a different date section
+                        isTodaySection = false; 
                     }
                 }
 
-                // 2. Extract data if inside today's target section
                 if (isTodaySection) {
                     const dataCell = row.querySelector('td.tableb');
                     if (dataCell) {
                         const eventDesc = dataCell.querySelector('div.eventdesc');
                         if (eventDesc) {
-                            // Extract neighborhood from p.location-name and clean up whitespace
                             let neighborhood = eventDesc.querySelector('p.location-name')?.innerText?.trim() || 'Unspecified';
                             neighborhood = neighborhood.replace(/\s+/g, ' '); 
 
-                            // Extract pharmacy name and phone number from within h4 a
                             const linkElement = eventDesc.querySelector('h4 a');
                             const fullText = linkElement ? linkElement.innerText.replace(/\s+/g, ' ').trim() : '';
                             
                             let pharmacyName = fullText;
                             let phoneNumber = 'Not Available';
                             
-                            // Split the pharmacy name and phone number using the "-" separator
                             if (fullText.includes('-')) {
                                 const parts = fullText.split('-');
                                 pharmacyName = parts[0].trim();
@@ -95,17 +124,22 @@ async function scrapePharmacies() {
         }, dateInfo.frenchPattern);
 
         if (pharmaciesToday.length === 0) {
-            console.log('⚠️ No pharmacies found for today\'s date. The website might not be updated yet.');
+            console.log('⚠️ No pharmacies found for today\'s date.');
             return;
         }
 
-        // Save the structured results to a JSON file
-        const fileName = `pharmacies_today_sale.json`;
-        fs.writeFileSync(fileName, JSON.stringify(pharmaciesToday, null, 2));
         console.log(`✅ Successfully extracted ${pharmaciesToday.length} pharmacies.`);
         
-        // Send the generated file to Telegram
-        await sendFileToTelegram(fileName, dateInfo.standard);
+        const aiSummaryMessage = await generateSummaryWithAI(pharmaciesToday, dateInfo.standard);
+        
+        if (aiSummaryMessage) {
+            await sendTextMessageToTelegram(aiSummaryMessage);
+        } else {
+            console.log('⚠️ AI generation failed, falling back to JSON backup file...');
+            const fileName = `pharmacies_today_sale.json`;
+            fs.writeFileSync(fileName, JSON.stringify(pharmaciesToday, null, 2));
+            await sendFileToTelegram(fileName, dateInfo.standard);
+        }
 
     } catch (error) {
         console.error('❌ An error occurred during scraping:', error);
@@ -114,35 +148,61 @@ async function scrapePharmacies() {
     }
 }
 
+async function sendTextMessageToTelegram(textMessage) {
+    const fetch = (await import('node-fetch')).default;
+    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+    
+    const cleanMessage = textMessage.trim();
+
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: CHAT_ID,
+                text: cleanMessage,
+                parse_mode: 'HTML' 
+            })
+        });
+        const result = await response.json();
+        if (result.ok) {
+            console.log('🚀 Gemini AI Summary report sent to Telegram successfully!');
+        } else {
+            console.error('❌ Failed to send text to Telegram:', result.description);
+            console.log('🔄 Trying to send as plain text fallback...');
+            await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_id: CHAT_ID, text: cleanMessage.replace(/<[^>]*>/g, '') })
+            });
+        }
+    } catch (err) {
+        console.error('❌ Telegram API error:', err);
+    }
+}
+
 async function sendFileToTelegram(filePath, dateStr) {
     const fetch = (await import('node-fetch')).default;
-    
-    // Read the local file buffer and transform it into a standard Blob payload
     const fileBuffer = fs.readFileSync(filePath);
     const fileBlob = new Blob([fileBuffer], { type: 'application/json' });
-    
     const form = new FormData();
     form.append('chat_id', CHAT_ID);
     form.append('caption', `🏥 On-duty pharmacies for Salé today (${dateStr}):`);
-    form.append('document', fileBlob, filePath); // Pass the Blob payload along with the filename
+    form.append('document', fileBlob, filePath);
 
     const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument`;
-    
     try {
         const response = await fetch(url, { method: 'POST', body: form });
         const result = await response.json();
         if (result.ok) {
-            console.log('🚀 Updated file sent to Telegram successfully!');
-            fs.unlinkSync(filePath); // Delete local file after a successful transmission
-        } else {
-            console.error('❌ Failed to send file to Telegram:', result.description);
+            console.log('🚀 Backup file sent successfully!');
+            fs.unlinkSync(filePath);
         }
     } catch (err) {
-        console.error('❌ Telegram API communication error:', err);
+        console.error(err);
     }
 }
 
-// Cron scheduler: Runs daily at 20:00 (8:00 PM) Moroccan Time
 cron.schedule('0 20 * * *', () => {
     scrapePharmacies();
 }, {
@@ -150,5 +210,5 @@ cron.schedule('0 20 * * *', () => {
     timezone: "Africa/Casablanca"
 });
 
-// Immediate execution call for testing and validating selectors on startup
+// Immediate call for testing
 scrapePharmacies();
